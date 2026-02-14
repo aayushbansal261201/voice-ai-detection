@@ -9,3 +9,11 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Dataset (DO NOT PUSH)
+dataset/
+
+# Ignore CNN files
+main_cnn.py
+train_cnn.py
+model/cnn_voice_model.pth
