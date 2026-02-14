@@ -11,7 +11,10 @@ import os
 # ------------------------------
 # LOAD TRAINED MODEL
 # ------------------------------
-model = joblib.load("model/voice_ai_detector.pkl")
+try:
+    model = joblib.load("model/voice_ai_detector.pkl")
+except Exception as e:
+    raise RuntimeError(f"Model loading failed: {e}")
 
 # ------------------------------
 # FASTAPI APP
@@ -19,11 +22,11 @@ model = joblib.load("model/voice_ai_detector.pkl")
 app = FastAPI(title="AI Voice Fraud Detection API")
 
 # ------------------------------
-# ENABLE CORS (React Support)
+# ENABLE CORS
 # ------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Restrict in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,7 +38,7 @@ app.add_middleware(
 API_KEY = "AB_live_aayush8628"
 
 # ------------------------------
-# REQUEST BODY SCHEMA
+# REQUEST SCHEMA
 # ------------------------------
 class VoiceRequest(BaseModel):
     language: str
@@ -43,63 +46,55 @@ class VoiceRequest(BaseModel):
     audioBase64: str
 
 # ------------------------------
-# FEATURE EXTRACTION (47 Features)
+# FEATURE EXTRACTION
 # ------------------------------
 def extract_features(y, sr):
     features = []
 
-    # MFCC (13 mean + 13 std = 26)
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
     features.extend(np.mean(mfcc, axis=1))
     features.extend(np.std(mfcc, axis=1))
 
-    # Zero Crossing Rate
     zcr = librosa.feature.zero_crossing_rate(y)
     features.append(np.mean(zcr))
     features.append(np.std(zcr))
 
-    # Spectral Centroid
     centroid = librosa.feature.spectral_centroid(y=y, sr=sr)
     features.append(np.mean(centroid))
     features.append(np.std(centroid))
 
-    # Spectral Bandwidth
     bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sr)
     features.append(np.mean(bandwidth))
     features.append(np.std(bandwidth))
 
-    # Spectral Roll-off
     rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)
     features.append(np.mean(rolloff))
     features.append(np.std(rolloff))
 
-    # Chroma (12)
     chroma = librosa.feature.chroma_stft(y=y, sr=sr)
     features.extend(np.mean(chroma, axis=1))
 
-    # Harmonic Ratio
     harmonic, percussive = librosa.effects.hpss(y)
-    harmonic_ratio = np.mean(np.abs(harmonic)) / (np.mean(np.abs(percussive)) + 1e-6)
+    harmonic_ratio = np.mean(np.abs(harmonic)) / (
+        np.mean(np.abs(percussive)) + 1e-6
+    )
     features.append(harmonic_ratio)
 
     return np.array(features).reshape(1, -1)
 
 # ------------------------------
-# MAIN API ENDPOINT
+# MAIN ENDPOINT
 # ------------------------------
 @app.post("/api/voice-detection")
 def detect_voice(data: VoiceRequest, x_api_key: str = Header(None)):
 
-    # API KEY VALIDATION
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    # Language validation
     allowed_languages = ["Tamil", "English", "Hindi", "Malayalam", "Telugu"]
     if data.language not in allowed_languages:
         raise HTTPException(status_code=400, detail="Unsupported language")
 
-    # Format validation
     if data.audioFormat.lower() != "mp3":
         raise HTTPException(status_code=400, detail="Only mp3 format supported")
 
@@ -109,77 +104,77 @@ def detect_voice(data: VoiceRequest, x_api_key: str = Header(None)):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid Base64 audio")
 
-    # Save temp file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-        tmp.write(audio_bytes)
-        temp_audio_path = tmp.name
-
-    # Load audio
+    # Save temporary file
+    temp_audio_path = None
     try:
-        y, sr = librosa.load(temp_audio_path, sr=None)
-    except Exception:
-        os.remove(temp_audio_path)
-        raise HTTPException(status_code=400, detail="Unable to read audio")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+            tmp.write(audio_bytes)
+            temp_audio_path = tmp.name
 
-    if y is None or len(y) == 0:
-        os.remove(temp_audio_path)
-        raise HTTPException(status_code=400, detail="Empty audio")
+        # Load audio (force mono for stability)
+        y, sr = librosa.load(temp_audio_path, sr=None, mono=True)
 
-    # ------------------------------
-    # CHUNK-BASED DETECTION
-    # ------------------------------
-    chunk_duration = 3  # seconds
-    chunk_samples = chunk_duration * sr
+        if y is None or len(y) == 0:
+            raise HTTPException(status_code=400, detail="Empty audio")
 
-    total_chunks = 0
-    ai_chunks = 0
-    confidences = []
+        # Chunk detection
+        chunk_duration = 3
+        chunk_samples = chunk_duration * sr
 
-    for start in range(0, len(y), chunk_samples):
-        end = start + chunk_samples
-        chunk = y[start:end]
+        total_chunks = 0
+        ai_chunks = 0
+        ai_probabilities = []
 
-        if len(chunk) < sr:  # Skip too small chunks
-            continue
+        for start in range(0, len(y), chunk_samples):
+            chunk = y[start:start + chunk_samples]
 
-        features = extract_features(chunk, sr)
+            if len(chunk) < sr:
+                continue
 
-        prediction = model.predict(features)[0]
-        prob = model.predict_proba(features)[0]
-        confidence = max(prob)
+            features = extract_features(chunk, sr)
 
-        total_chunks += 1
-        confidences.append(confidence)
+            prediction = model.predict(features)[0]
+            prob = model.predict_proba(features)[0]
 
-        if prediction == 1:
-            ai_chunks += 1
+            ai_probability = prob[1]  # Probability of AI class
+            ai_probabilities.append(ai_probability)
 
-    os.remove(temp_audio_path)
+            total_chunks += 1
 
-    if total_chunks == 0:
-        raise HTTPException(status_code=400, detail="Audio too short")
+            if prediction == 1:
+                ai_chunks += 1
 
-    ai_percentage = round((ai_chunks / total_chunks) * 100)
-    avg_confidence = round(float(np.mean(confidences)), 2)
+        if total_chunks == 0:
+            raise HTTPException(status_code=400, detail="Audio too short")
 
-    # FINAL CLASSIFICATION LOGIC
-    if ai_percentage > 50:
-        label = "AI_GENERATED"
-        explanation = "Majority of segments show synthetic voice characteristics."
-    elif 0 < ai_percentage <= 50:
-        label = "PARTIALLY_AI"
-        explanation = "Mixed voice detected with partial AI-generated segments."
-    else:
-        label = "HUMAN"
-        explanation = "Natural pitch and harmonic variations detected."
+        ai_percentage = round((ai_chunks / total_chunks) * 100)
+        avg_confidence = round(float(np.mean(ai_probabilities)), 2)
 
-    # Required format response
-    return {
-    "status": "success",
-    "language": data.language,
-    "classification": label,
-    "confidenceScore": avg_confidence,
-    "explanation": explanation
-}
+        # Final classification
+        if ai_percentage > 50:
+            label = "AI_GENERATED"
+            explanation = "Majority of segments show synthetic voice characteristics."
+        elif 0 < ai_percentage <= 50:
+            label = "PARTIALLY_AI"
+            explanation = "Mixed voice detected with partial AI-generated segments."
+        else:
+            label = "HUMAN"
+            explanation = "Natural pitch and harmonic variations detected."
 
-    
+        return {
+            "status": "success",
+            "language": data.language,
+            "classification": label,
+            "confidenceScore": avg_confidence,
+            "explanation": explanation
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Processing failed: {str(e)}")
+
+    finally:
+        if temp_audio_path and os.path.exists(temp_audio_path):
+            os.remove(temp_audio_path)
